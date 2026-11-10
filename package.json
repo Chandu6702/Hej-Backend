@@ -4,12 +4,12 @@
   "main": "index.js",
   "type": "module",
   "scripts": {
-    "dev": "nodemon index.js"
+    "dev": "nodemon index.js",
     "start": "node index.js"
   },
-  "keywords": [],
+  "keywords": [], 
   "author": "",
-  "license": "ISC",
+  "license": "ISC",   
   "description": "",
   "dependencies": {
     "bcryptjs": "^2.4.3",

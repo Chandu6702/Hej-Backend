@@ -1,152 +1,379 @@
+
+import mongoose from "mongoose";
 import User from "../models/user.model.js";
 
+// ========================================
+// SEND FRIEND REQUEST
+// ========================================
+
 export const sendFriendRequest = async (req, res) => {
-  try {
-    const { friendId } = req.body;
-    const userId = req.user._id;
+    try {
+        const { friendId } = req.body;
+        const userId = req.user._id;
 
-    if (friendId === userId) {
-      return res
-        .status(400)
-        .json({ message: "You cannot send a request to yourself." });
+        if (!friendId || !mongoose.Types.ObjectId.isValid(friendId)) {
+            return res.status(400).json({
+                message: "Invalid friend ID.",
+            });
+        }
+
+        if (friendId.toString() === userId.toString()) {
+            return res.status(400).json({
+                message: "You cannot send a request to yourself.",
+            });
+        }
+
+        const [sender, receiver] = await Promise.all([
+            User.findById(userId),
+            User.findById(friendId),
+        ]);
+
+        if (!sender || !receiver) {
+            return res.status(404).json({
+                message: "User not found.",
+            });
+        }
+
+        const alreadyFriends = sender.friends.some(
+            (id) => id.toString() === friendId.toString()
+        );
+
+        if (alreadyFriends) {
+            return res.status(400).json({
+                message: "You are already friends.",
+            });
+        }
+
+        // Check outgoing request.
+        const outgoingRequest = receiver.friendRequests.some(
+            (request) =>
+                request.from.toString() === userId.toString()
+        );
+
+        // Check incoming request.
+        const incomingRequest = sender.friendRequests.some(
+            (request) =>
+                request.from.toString() === friendId.toString()
+        );
+
+        if (outgoingRequest || incomingRequest) {
+            return res.status(400).json({
+                message: "A friend request already exists.",
+            });
+        }
+
+        receiver.friendRequests.push({
+            from: userId,
+        });
+
+        await receiver.save();
+
+        return res.status(200).json({
+            message: "Friend request sent successfully.",
+        });
+
+    } catch (error) {
+        console.error("Error in sendFriendRequest:", error);
+
+        return res.status(500).json({
+            message: "Internal Server Error.",
+        });
     }
-
-    const user = await User.findById(friendId);
-    if (!user) return res.status(404).json({ message: "User not found" });
-
-    const sender = await User.findById(userId);
-    if (user.friends.includes(userId)) {
-      return res.status(400).json({ message: "You are already friends." });
-    }
-
-    const existingRequest = user.friendRequests.some(
-      (req) => req.from.toString() === userId.toString()
-    );
-    if (existingRequest) {
-      return res.status(400).json({ message: "Friend request already sent." });
-    }
-
-    user.friendRequests.push({ from: userId });
-    await user.save();
-
-    res.status(200).json({ message: "Friend request sent successfully." });
-  } catch (error) {
-    console.error("Error in sendFriendRequest:", error.message);
-    return res.status(500).json({ message: "Internal Server Error" });
-  }
 };
+
+
+// ========================================
+// GET FRIEND REQUESTS
+// ========================================
 
 export const getFriendRequests = async (req, res) => {
-  try {
-    const userId = req.user._id;
-    const user = await User.findById(userId).populate({
-      path: "friendRequests.from",
-      select: "-password",
-    });
+    try {
+        const user = await User.findById(req.user._id)
+            .populate({
+                path: "friendRequests.from",
+                select: "fullName profilePic",
+            })
+            .select("friendRequests");
 
-    if (!user) return res.status(404).json({ message: "User not found." });
+        if (!user) {
+            return res.status(404).json({
+                message: "User not found.",
+            });
+        }
 
-    res.status(200).json(user.friendRequests);
-  } catch (error) {
-    console.error("Error fetching friend requests:", error.message);
-    res.status(500).json({ message: "Failed to fetch friend requests." });
-  }
+        return res.status(200).json(user.friendRequests);
+
+    } catch (error) {
+        console.error("Error in getFriendRequests:", error);
+
+        return res.status(500).json({
+            message: "Failed to fetch friend requests.",
+        });
+    }
 };
 
+
+// ========================================
+// RESPOND TO FRIEND REQUEST
+// ========================================
+
 export const respondToFriendRequest = async (req, res) => {
-  try {
     const { requestId, status } = req.body;
     const userId = req.user._id;
 
-    const user = await User.findById(userId);
-    const requestIndex = user.friendRequests.findIndex(
-      (req) => req._id.toString() === requestId
-    );
-    if (requestIndex === -1) {
-      return res.status(404).json({ message: "Friend request not found." });
+    if (!requestId || !mongoose.Types.ObjectId.isValid(requestId)) {
+        return res.status(400).json({
+            message: "Invalid request ID.",
+        });
     }
 
-    const request = user.friendRequests[requestIndex];
-    user.friendRequests.splice(requestIndex, 1);
-
-    if (status === "accepted") {
-      if (!user.friends.includes(request.from)) {
-        user.friends.push(request.from);
-        const friend = await User.findById(request.from);
-        friend.friends.push(userId);
-        await friend.save();
-      }
+    if (!["accepted", "rejected"].includes(status)) {
+        return res.status(400).json({
+            message: "Invalid request status.",
+        });
     }
 
-    await user.save();
+    const session = await mongoose.startSession();
 
-    res.status(200).json({ message: `Friend request ${status}.` });
-  } catch (error) {
-    console.error("Error in respondToFriendRequest:", error.message);
-    return res.status(500).json({ message: "Internal Server Error" });
-  }
+    try {
+        await session.withTransaction(async () => {
+            const user = await User.findById(userId).session(session);
+
+            if (!user) {
+                throw new Error("USER_NOT_FOUND");
+            }
+
+            const requestIndex = user.friendRequests.findIndex(
+                (request) =>
+                    request._id.toString() === requestId.toString()
+            );
+
+            if (requestIndex === -1) {
+                throw new Error("REQUEST_NOT_FOUND");
+            }
+
+            const request = user.friendRequests[requestIndex];
+
+            if (status === "accepted") {
+                const friend = await User.findById(
+                    request.from
+                ).session(session);
+
+                if (!friend) {
+                    throw new Error("SENDER_NOT_FOUND");
+                }
+
+                const alreadyFriends = user.friends.some(
+                    (id) =>
+                        id.toString() === friend._id.toString()
+                );
+
+                if (!alreadyFriends) {
+                    user.friends.push(friend._id);
+                }
+
+                const friendAlreadyHasUser = friend.friends.some(
+                    (id) =>
+                        id.toString() === userId.toString()
+                );
+
+                if (!friendAlreadyHasUser) {
+                    friend.friends.push(userId);
+                }
+
+                await friend.save({ session });
+            }
+
+            user.friendRequests.splice(requestIndex, 1);
+
+            await user.save({ session });
+        });
+
+        return res.status(200).json({
+            message: `Friend request ${status} successfully.`,
+        });
+
+    } catch (error) {
+        console.error("Error in respondToFriendRequest:", error);
+
+        const errors = {
+            USER_NOT_FOUND: [404, "User not found."],
+            REQUEST_NOT_FOUND: [404, "Friend request not found."],
+            SENDER_NOT_FOUND: [404, "Sender no longer exists."],
+        };
+
+        const knownError = errors[error.message];
+
+        return res.status(knownError?.[0] || 500).json({
+            message: knownError?.[1] || "Internal Server Error.",
+        });
+
+    } finally {
+        await session.endSession();
+    }
 };
+
+
+// ========================================
+// GET FRIENDS
+// ========================================
 
 export const getFriends = async (req, res) => {
-  try {
-    const userId = req.user._id;
-    const user = await User.findById(userId)
-      .populate("friends")
-      .select("-password");
-    if (!user) return res.status(404).json({ message: "User not found." });
+    try {
+        const user = await User.findById(req.user._id)
+            .populate({
+                path: "friends",
+                select: "fullName profilePic email",
+            })
+            .select("friends");
 
-    res.status(200).json(user.friends);
-  } catch (error) {
-    console.error("Error in getFriends:", error.message);
-    return res.status(500).json({ message: "Internal Server Error" });
-  }
+        if (!user) {
+            return res.status(404).json({
+                message: "User not found.",
+            });
+        }
+
+        return res.status(200).json(user.friends);
+
+    } catch (error) {
+        console.error("Error in getFriends:", error);
+
+        return res.status(500).json({
+            message: "Internal Server Error.",
+        });
+    }
 };
+
+
+// ========================================
+// GET USERS WITH PAGINATION
+// ========================================
 
 export const getUsers = async (req, res) => {
-  try {
-    const loggedInUserID = req.user._id;
-    const { page = 1, limit = 10 } = req.query;
+    try {
+        const userId = req.user._id;
 
-    const loggedInUser = await User.findById(loggedInUserID).select("friends");
+        const page = Math.max(
+            1,
+            parseInt(req.query.page, 10) || 1
+        );
 
-    const filteredUsers = await User.find({
-      _id: { $ne: loggedInUserID, $nin: loggedInUser.friends },
-    })
-      .select("-password")
-      .skip((page - 1) * Number(limit))
-      .limit(Number(limit));
+        const limit = Math.min(
+            50,
+            Math.max(
+                1,
+                parseInt(req.query.limit, 10) || 10
+            )
+        );
 
-    const totalUsers = await User.countDocuments({
-      _id: { $ne: loggedInUserID, $nin: loggedInUser.friends },
-    });
+        const loggedInUser = await User.findById(userId);
 
-    res.status(200).json({
-      filteredUsers,
-      totalPages: Math.ceil(totalUsers / limit),
-      currentPage: Number(page),
-    });
-  } catch (error) {
-    console.error("Error in getUsers controller", error.message);
-    return res.status(500).json({ message: "Internal Server Error" });
-  }
+        if (!loggedInUser) {
+            return res.status(404).json({
+                message: "User not found.",
+            });
+        }
+
+        // Exclude yourself, existing friends,
+        // incoming requests and outgoing requests.
+
+        const outgoingRequests = await User.find({
+            "friendRequests.from": userId,
+        }).distinct("_id");
+
+        const excludedIds = [
+            userId,
+            ...loggedInUser.friends,
+            ...loggedInUser.friendRequests.map(
+                (request) => request.from
+            ),
+            ...outgoingRequests,
+        ];
+
+        const filter = {
+            _id: {
+                $nin: excludedIds,
+            },
+        };
+
+        const skip = (page - 1) * limit;
+
+        const [filteredUsers, totalUsers] = await Promise.all([
+            User.find(filter)
+                .select("fullName profilePic email")
+                .sort({ _id: 1 })
+                .skip(skip)
+                .limit(limit),
+
+            User.countDocuments(filter),
+        ]);
+
+        return res.status(200).json({
+            filteredUsers,
+            currentPage: page,
+            totalPages: Math.ceil(totalUsers / limit),
+            totalUsers,
+            hasMore: skip + filteredUsers.length < totalUsers,
+        });
+
+    } catch (error) {
+        console.error("Error in getUsers:", error);
+
+        return res.status(500).json({
+            message: "Internal Server Error.",
+        });
+    }
 };
 
+
+// ========================================
+// SEARCH USERS
+// ========================================
+
 export const searchUsers = async (req, res) => {
-  try {
-    const { query } = req.query;
-    const loggedInUserID = req.user._id;
+    try {
+        const query = req.query.query?.trim();
+        const userId = req.user._id;
 
-    const users = await User.find({
-      _id: { $ne: loggedInUserID },
-      $or: [
-        { name: { $regex: query, $options: "i" } },
-        { email: { $regex: query, $options: "i" } },
-      ],
-    }).select("-password");
+        if (!query) {
+            return res.status(200).json([]);
+        }
 
-    res.status(200).json(users);
-  } catch (error) {
-    console.error("Error in searchUsers controller", error.message);
-    return res.status(500).json({ message: "Internal Server Error" });
-  }
+        const escapedQuery = query.replace(
+            /[.*+?^${}()|[\]\\]/g,
+            "\\$&"
+        );
+
+        const users = await User.find({
+            _id: {
+                $ne: userId,
+            },
+
+            $or: [
+                {
+                    fullName: {
+                        $regex: escapedQuery,
+                        $options: "i",
+                    },
+                },
+                {
+                    email: {
+                        $regex: escapedQuery,
+                        $options: "i",
+                    },
+                },
+            ],
+        })
+            .select("fullName profilePic email")
+            .limit(20);
+
+        return res.status(200).json(users);
+
+    } catch (error) {
+        console.error("Error in searchUsers:", error);
+
+        return res.status(500).json({
+            message: "Internal Server Error.",
+        });
+    }
 };
